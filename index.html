@@ -19,25 +19,53 @@ let stopTimer=null, stream=null, rec=null, chunks=[], mirror=true;
 const $=id=>document.getElementById(id);
 function load(){
   for(const [k] of CATS){if(!manifest[k])manifest[k]=[]}
-  loadCustom(); renderThemes(); renderCards(); renderUploads(); draw();
+  loadCustom().then(()=>{ renderThemes(); renderCards(); renderUploads(); draw(); });
 }
-function loadCustom(){
-  try{state.custom=JSON.parse(localStorage.getItem('fairy-custom')||'{}')}catch{state.custom={}}
+const CUSTOM_DB='fairy-filter-custom-v2';
+function openCustomDB(){return new Promise((resolve,reject)=>{
+  if(!('indexedDB' in window)){reject(new Error('IndexedDB unavailable'));return;}
+  const r=indexedDB.open(CUSTOM_DB,1);
+  r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains('items'))r.result.createObjectStore('items',{keyPath:'id'});};
+  r.onsuccess=()=>resolve(r.result); r.onerror=()=>reject(r.error||new Error('IndexedDB error'));
+})}
+async function getStoredCustom(){
+  try{const db=await openCustomDB();return await new Promise((resolve,reject)=>{const tx=db.transaction('items','readonly'),st=tx.objectStore('items'),r=st.getAll();r.onsuccess=()=>resolve(r.result||[]);r.onerror=()=>reject(r.error)});}catch{return []}
+}
+async function putCustomItems(itemsToSave){
+  if(!itemsToSave.length)return;
+  const db=await openCustomDB();
+  await new Promise((resolve,reject)=>{const tx=db.transaction('items','readwrite'),st=tx.objectStore('items');itemsToSave.forEach(it=>st.put(it));tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error||new Error('Could not save items'));});
+}
+async function deleteCustomItem(id){
+  try{const db=await openCustomDB();await new Promise((resolve,reject)=>{const tx=db.transaction('items','readwrite');tx.objectStore('items').delete(id);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error)});}catch{}
+}
+async function loadCustom(){
   try{state.removed=JSON.parse(localStorage.getItem('fairy-removed')||'{}')}catch{state.removed={}}
-  // Migrate custom items from the old Pants/Skirts/Accessory categories into Bottoms.
-  const oldBottoms=[...(state.custom.pants||[]),...(state.custom.skirts||[])];
-  if(oldBottoms.length){state.custom.bottoms=[...(state.custom.bottoms||[]),...oldBottoms]}
-  delete state.custom.pants; delete state.custom.skirts;
-  for(const [k] of CATS){
-    state.custom[k]=state.custom[k]||[];
-    state.removed[k]=state.removed[k]||{};
-    state.custom[k].forEach((it,i)=>{if(!it.id)it.id='custom-'+k+'-'+i+'-'+Math.random().toString(36).slice(2)})
-    if(state.custom[k].length) manifest[k]=(manifest[k]||[]).concat(state.custom[k])
+  state.custom={};
+  let stored=await getStoredCustom();
+  // One-time migration from the old localStorage system. This is important because
+  // large image uploads can exceed the browser's localStorage quota.
+  if(!stored.length){
+    try{
+      const old=JSON.parse(localStorage.getItem('fairy-custom')||'{}');
+      const oldItems=[];
+      for(const k of Object.keys(old||{})){for(const it of (old[k]||[])){oldItems.push({...it,category:k})}}
+      if(oldItems.length){await putCustomItems(oldItems);stored=oldItems;localStorage.removeItem('fairy-custom');}
+    }catch{}
   }
-  saveCustom(); saveRemoved();
+  // Move any old custom Pants/Skirts into Bottoms.
+  stored.forEach(it=>{if(it.category==='pants'||it.category==='skirt'||it.category==='skirts')it.category='bottoms';});
+  try{await putCustomItems(stored);}catch{}
+  for(const [k] of CATS){
+    state.custom[k]=stored.filter(it=>it.category===k);
+    state.removed[k]=state.removed[k]||{};
+    state.custom[k].forEach((it,i)=>{if(!it.id)it.id='custom-'+k+'-'+i+'-'+Math.random().toString(36).slice(2)});
+    if(state.custom[k].length) manifest[k]=(manifest[k]||[]).concat(state.custom[k]);
+  }
+  saveRemoved();
 }
-function saveCustom(){localStorage.setItem('fairy-custom',JSON.stringify(state.custom))}
-function saveRemoved(){localStorage.setItem('fairy-removed',JSON.stringify(state.removed))}
+function saveCustom(){/* Custom images are stored in IndexedDB, not localStorage. */}
+function saveRemoved(){try{localStorage.setItem('fairy-removed',JSON.stringify(state.removed))}catch{}}
 function itemId(k,it){return it.id||('builtin-'+k+'-'+(it.name||it.label||'item'))}
 function isRemoved(k,it){return !!(state.removed[k]&&state.removed[k][itemId(k,it)])}
 function activeItems(k){return (manifest[k]||[]).filter(it=>!isRemoved(k,it))}
@@ -212,9 +240,17 @@ function renderUploads(){
   });
   el.querySelectorAll('input').forEach(inp=>inp.onchange=async e=>{
     const k=e.target.dataset.up, files=[...e.target.files], added=[];
-    for(const f of files){const src=await fileData(f);added.push({id:'custom-'+k+'-'+Date.now()+'-'+Math.random().toString(36).slice(2),name:f.name,label:f.name,src,tags:['random','pastel']})}
-    state.custom[k]=(state.custom[k]||[]).concat(added);saveCustom();manifest[k]=(manifest[k]||[]).concat(added);renderCards();
-    alert(`${added.length} item(s) added to ${k}.`); e.target.value='';
+    try{
+      for(const f of files){const src=await fileData(f);added.push({id:'custom-'+k+'-'+Date.now()+'-'+Math.random().toString(36).slice(2),category:k,name:f.name,label:f.name,src,tags:['random','pastel']})}
+      await putCustomItems(added);
+      state.custom[k]=(state.custom[k]||[]).concat(added);
+      manifest[k]=(manifest[k]||[]).concat(added);
+      renderCards(); draw();
+      alert(`${added.length} item(s) added to ${k}.`);
+    }catch(err){
+      alert('I could not save those pictures. Please try again, and make sure your browser has storage available.');
+    }
+    e.target.value='';
   });
   el.querySelectorAll('[data-manage]').forEach(b=>b.onclick=()=>openManager(b.dataset.manage));
 }
